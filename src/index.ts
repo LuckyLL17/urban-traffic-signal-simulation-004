@@ -46,13 +46,140 @@ app.get('/api/simulations/:id',async(req:any,res)=>{const r=runs.find(x=>x.id===
 app.get('/api/audit',async()=>audit.slice(-100));
 
 // Advanced operations: corridor coordination, transit priority, pedestrian safety and emissions.
-const priorityRequests:any[]=[]; const corridors:any[]=[{id:'C-01',name:'中山路绿波走廊',intersectionIds:['J-01','J-02','J-03'],lengthMeters:2400,targetSpeedKph:36}]; const scenarioPolicies:any[]=[];
+type CoordinationDirection='forward'|'reverse';
+type CoordinationStatus='calculated'|'previewed'|'rejected'|'published'|'superseded';
+type Corridor={id:string;name:string;intersectionIds:string[];lengthMeters:number;targetSpeedKph:number};
+type NetworkFingerprint={cycles:Record<string,number>;offsets:Record<string,number|null>};
+type CoordinationSegment={fromId:string;toId:string;distanceMeters:number;travelSeconds:number};
+type CoordinationProposal={ordinal:number;intersectionId:string;cumulativeDistanceMeters:number;cumulativeTravelSeconds:number;offsetSeconds:number;wrapCount:number};
+type CoordinationPlan={id:string;corridorId:string;version:number;status:CoordinationStatus;speedKph:number;direction:CoordinationDirection;referenceCycleSeconds:number;canonicalIntersectionIds:string[];orderedIntersectionIds:string[];distancesMeters:number[];segments:CoordinationSegment[];proposals:CoordinationProposal[];offsets:Record<string,number>;baseFingerprint:NetworkFingerprint;createdAt:string;updatedAt:string;preview?:{at:string;referenceCycleSeconds:number;currentOffsets:Record<string,number|null>;proposedOffsets:Record<string,number>;changes:{intersectionId:string;fromOffset:number|null;toOffset:number;changed:boolean;wrapCount:number}[];totalWrapCount:number};rejectedAt?:string;rejectReason?:string;publishedAt?:string;supersededAt?:string;supersededVersionIds?:string[]};
+const priorityRequests:any[]=[]; const corridors:Corridor[]=[{id:'C-01',name:'中山路绿波走廊',intersectionIds:['J-01','J-02','J-03'],lengthMeters:2400,targetSpeedKph:36}]; const scenarioPolicies:any[]=[]; const coordinationPlans:CoordinationPlan[]=[];
+const finiteNumber=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
+const corridorJunctions=(corridor:Corridor)=>{
+ const errors:string[]=[]; const ids=Array.isArray(corridor.intersectionIds)?corridor.intersectionIds.slice():[];
+ if(ids.length===0)errors.push('corridor has no intersections');
+ const seen=new Set<string>();
+ for(const id of ids){if(typeof id!=='string'||!id)errors.push('corridor contains an invalid intersection id');if(seen.has(id))errors.push(`${id}: duplicated corridor order`);seen.add(id);}
+ const junctions=ids.map(id=>intersections.find(x=>x.id===id));
+ junctions.forEach((j,i)=>{if(!j)errors.push(`${ids[i]}: intersection not found`);else if(!Number.isInteger(j.cycle)||j.cycle<=0)errors.push(`${j.id}: invalid cycle`);});
+ return {ids,junctions:junctions.filter((j):j is Intersection=>Boolean(j)),errors};
+};
+const networkFingerprint=(junctions:Intersection[]):NetworkFingerprint=>({cycles:Object.fromEntries(junctions.map(j=>[j.id,j.cycle])),offsets:Object.fromEntries(junctions.map(j=>[j.id,j.offset??null]))});
+const sameFingerprint=(a:NetworkFingerprint,b:NetworkFingerprint)=>JSON.stringify(a)===JSON.stringify(b);
+function normalizeSegmentDistances(body:any,ids:string[],corridor:Corridor){
+ const errors:string[]=[]; const count=Math.max(0,ids.length-1); let distances:number[]=[];
+ const links=body.links; const rawDistances=body.distancesMeters??body.distances;
+ if(rawDistances!==undefined&&links!==undefined)errors.push('distancesMeters 和 links 只能提供一种');
+ if(rawDistances!==undefined){
+  if(!Array.isArray(rawDistances)||rawDistances.length!==count)errors.push(`distancesMeters 必须是长度 ${count} 的相邻路段数组`);
+  else distances=rawDistances.map((v:unknown,i:number)=>{if(!finiteNumber(v)||v<=0||v>100000){errors.push(`distancesMeters[${i}]: 必须是 0-100000 米之间的正数`);return 0;}return v;});
+ }else if(links!==undefined){
+  if(!Array.isArray(links)||links.length!==count)errors.push(`links 必须包含 ${count} 条相邻路段`);
+  else{distances=new Array(count).fill(0);const used=new Array(count).fill(false);
+   links.forEach((link:any,i:number)=>{
+    if(!link||typeof link.fromId!=='string'||typeof link.toId!=='string'){errors.push(`links[${i}]: fromId 和 toId 必填`);return;}
+    const distance=link.distanceMeters??link.lengthMeters;if(!finiteNumber(distance)||distance<=0||distance>100000){errors.push(`links[${i}]: distanceMeters 必须是 0-100000 米之间的正数`);return;}
+    const a=ids.indexOf(link.fromId),b=ids.indexOf(link.toId);let index=-1;
+    if(a>=0&&b===a+1)index=a;else if(b>=0&&a===b+1)index=b;
+    if(index<0){errors.push(`links[${i}]: ${link.fromId} -> ${link.toId} 必须是走廊顺序中的相邻路口`);return;}
+    if(used[index])errors.push(`links[${i}]: 相邻路段重复`);used[index]=true;distances[index]=distance;
+   });
+  }
+ }else if(ids.length>1){
+  if(!finiteNumber(corridor.lengthMeters)||corridor.lengthMeters<=0||corridor.lengthMeters>100000)errors.push('走廊 lengthMeters 非法；请在 distancesMeters 或 links 中提供相邻路段实际距离');
+  else distances=new Array(count).fill(corridor.lengthMeters/count);
+ }
+ return {errors,distances};
+}
+function buildCoordinationPlan(corridor:Corridor,body:any){
+ const {ids,junctions,errors:configErrors}=corridorJunctions(corridor);
+ const errors:string[]=[]; const speed=body?.speedKph??corridor.targetSpeedKph;
+ if(!finiteNumber(speed)||speed<10||speed>70)errors.push('speedKph must be 10-70');
+ const direction=body?.direction??body?.travelDirection??'forward';
+ if(direction!=='forward'&&direction!=='reverse')errors.push("direction 必须是 'forward' 或 'reverse'");
+ const distanceResult=normalizeSegmentDistances(body??{},ids,corridor);
+ errors.push(...distanceResult.errors);
+ if(configErrors.length||errors.length)return {configErrors:[...configErrors,...(configErrors.length?errors:[])],errors:configErrors.length?[]:errors};
+ const referenceCycleSeconds=Math.max(...junctions.map(j=>j.cycle));
+ const orderedIntersectionIds=direction==='reverse'?ids.slice().reverse():ids.slice();
+ const segments:CoordinationSegment[]=[];const proposals:CoordinationProposal[]=[];const offsets:Record<string,number>={};
+ let cumulativeDistance=0;let cumulativeSeconds=0;
+ orderedIntersectionIds.forEach((id,ordinal)=>{
+  if(ordinal>0){
+   const fromId=orderedIntersectionIds[ordinal-1];const toId=id;
+   const canonicalIndex=Math.min(ids.indexOf(fromId),ids.indexOf(toId));
+   const distanceMeters=distanceResult.distances[canonicalIndex];const travelSeconds=distanceMeters/(speed/3.6);
+   cumulativeDistance+=distanceMeters;cumulativeSeconds+=travelSeconds;segments.push({fromId,toId,distanceMeters,travelSeconds:Number(travelSeconds.toFixed(3))});
+  }
+  const roundedSeconds=Math.round(cumulativeSeconds);const wrapCount=Math.floor(roundedSeconds/referenceCycleSeconds);
+  const offsetSeconds=((roundedSeconds%referenceCycleSeconds)+referenceCycleSeconds)%referenceCycleSeconds;
+  offsets[id]=offsetSeconds;proposals.push({ordinal,intersectionId:id,cumulativeDistanceMeters:Number(cumulativeDistance.toFixed(3)),cumulativeTravelSeconds:Number(cumulativeSeconds.toFixed(3)),offsetSeconds,wrapCount});
+ });
+ const version=coordinationPlans.reduce((max,p)=>p.corridorId===corridor.id?Math.max(max,p.version):max,0)+1;
+ const time=now();
+ const plan:CoordinationPlan={id:randomUUID(),corridorId:corridor.id,version,status:'calculated',speedKph:speed,direction,referenceCycleSeconds,canonicalIntersectionIds:ids,orderedIntersectionIds,distancesMeters:distanceResult.distances,segments,proposals,offsets,baseFingerprint:networkFingerprint(junctions),createdAt:time,updatedAt:time};
+ return {plan};
+}
+function previewCoordinationPlan(plan:CoordinationPlan,corridor:Corridor){
+ if(plan.status!=='calculated'&&plan.status!=='previewed')return {error:`plan in status ${plan.status} cannot be previewed`,statusCode:409};
+ const {ids,junctions,errors}=corridorJunctions(corridor);
+ if(errors.length)return {error:errors.join('; '),statusCode:409};
+ const current=networkFingerprint(junctions);
+ if(!sameFingerprint(plan.baseFingerprint,current))return {error:'network changed after calculation; calculate a new version',statusCode:409};
+ const currentCycle=Math.max(...junctions.map(j=>j.cycle));
+ if(currentCycle!==plan.referenceCycleSeconds)return {error:'reference cycle changed; calculate a new version',statusCode:409};
+ const changes=plan.proposals.map(p=>({intersectionId:p.intersectionId,fromOffset:current.offsets[p.intersectionId],toOffset:p.offsetSeconds,changed:current.offsets[p.intersectionId]!==p.offsetSeconds,wrapCount:p.wrapCount}));
+ plan.preview={at:now(),referenceCycleSeconds:currentCycle,currentOffsets:current.offsets,proposedOffsets:{...plan.offsets},changes,totalWrapCount:plan.proposals[plan.proposals.length-1]?.wrapCount??0};
+ plan.status='previewed';plan.updatedAt=now();
+ return {plan,preview:plan.preview};
+}
+function publishCoordinationPlan(plan:CoordinationPlan,corridor:Corridor){
+ if(plan.status==='published')return {plan,alreadyPublished:true};
+ if(plan.status!=='previewed')return {error:`plan in status ${plan.status} must be previewed before publish`,statusCode:409};
+ const {junctions,errors}=corridorJunctions(corridor);
+ if(errors.length)return {error:errors.join('; '),statusCode:409};
+ const current=networkFingerprint(junctions);
+ if(!sameFingerprint(plan.baseFingerprint,current))return {error:'network changed after preview; calculate and preview a new version',statusCode:409};
+ if(Math.max(...junctions.map(j=>j.cycle))!==plan.referenceCycleSeconds)return {error:'reference cycle changed after preview; calculate a new version',statusCode:409};
+ for(const proposal of plan.proposals){const j=junctions.find(x=>x.id===proposal.intersectionId)!;if(!Number.isInteger(proposal.offsetSeconds)||proposal.offsetSeconds<0||proposal.offsetSeconds>=plan.referenceCycleSeconds)return {error:`${j.id}: illegal offset`,statusCode:422};}
+ const previousPublished=coordinationPlans.filter(p=>p.corridorId===corridor.id&&p.status==='published');
+ for(const proposal of plan.proposals)junctions.find(j=>j.id===proposal.intersectionId)!.offset=proposal.offsetSeconds;
+ const time=now();
+ for(const previous of previousPublished){previous.status='superseded';previous.supersededAt=time;previous.updatedAt=time;}
+ plan.status='published';plan.publishedAt=time;plan.updatedAt=time;plan.supersededVersionIds=previousPublished.map(p=>p.id);
+ return {plan};
+}
 app.get('/api/corridors',async()=>corridors);
-app.post('/api/corridors/:id/coordinate',async(req:any,res)=>{const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});const b=req.body as any;const speedKph=Number(b.speedKph||c.targetSpeedKph);if(speedKph<10||speedKph>70)return res.code(400).send({error:'speedKph must be 10-70'});const cycle=Math.max(...c.intersectionIds.map((id:string)=>intersections.find(x=>x.id===id)?.cycle||60));const offsets:any={};let distanceSeconds=0;for(const id of c.intersectionIds){const j=intersections.find(x=>x.id===id)!;distanceSeconds+=c.lengthMeters/c.intersectionIds.length/(speedKph/3.6);offsets[id]=Math.round(distanceSeconds%cycle);j.offset=offsets[id];}const plan={id:randomUUID(),corridorId:c.id,cycleSeconds:cycle,speedKph,offsets,createdAt:now(),status:'coordinated'};plans.push(plan);log('corridor.coordinate',plan);return plan;});
-app.post('/api/priority-requests',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const r={id:randomUUID(),intersectionId:b.intersectionId,routeId:b.routeId,etaSeconds:Number(b.etaSeconds),passengers:Number(b.passengers||0),requestType:b.requestType||'transit',status:'requested',requestedAt:now()};r.approved=r.passengers>=20||r.requestType==='emergency';r.status=r.approved?'approved':'deferred';priorityRequests.push(r);log('priority.request',r);return r;});
+app.get('/api/corridors/:id/coordination-plans',async(req:any,res)=>{const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});return coordinationPlans.filter(p=>p.corridorId===c.id).sort((a,b)=>b.version-a.version);});
+app.get('/api/corridors/:id/coordination-plans/:planId',async(req:any,res)=>{const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});const p=coordinationPlans.find(x=>x.corridorId===c.id&&x.id===(req.params as any).planId);if(!p)return res.code(404).send({error:'coordination plan not found'});return p;});
+app.post('/api/corridors/:id/coordinate',async(req:any,res)=>{
+ const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});
+ const b=req.body as any;const action=b?.action??b?.phase??'calculate';
+ if(action==='calculate'||action==='recalculate'){
+  const built=buildCoordinationPlan(c,b);
+  if(built.configErrors?.length)return res.code(409).send({error:built.configErrors.join('; ')});
+  if(built.errors?.length)return res.code(400).send({error:built.errors.join('; ')});
+  coordinationPlans.push(built.plan!);log('corridor.coordination.calculate',structuredClone(built.plan!));return res.code(201).send(built.plan);
+ }
+ const planId=b?.planId??b?.id;const plan=coordinationPlans.find(x=>x.corridorId===c.id&&x.id===planId);
+ if(!plan)return res.code(404).send({error:'coordination plan not found'});
+ if(action==='preview'){const result=previewCoordinationPlan(plan,c);if('error'in result)return res.code(result.statusCode!).send({error:result.error});log('corridor.coordination.preview',structuredClone({plan:result.plan,preview:result.preview}));return {plan:result.plan,preview:result.preview};}
+ if(action==='reject'){
+  if(plan.status!=='calculated'&&plan.status!=='previewed')return res.code(409).send({error:`plan in status ${plan.status} cannot be rejected`});
+  plan.status='rejected';plan.rejectReason=typeof b.reason==='string'?b.reason:undefined;plan.rejectedAt=now();plan.updatedAt=plan.rejectedAt;
+  log('corridor.coordination.reject',structuredClone(plan));return plan;
+ }
+ if(action==='publish'){const result=publishCoordinationPlan(plan,c);if('error'in result)return res.code(result.statusCode!).send({error:result.error});log('corridor.coordination.publish',structuredClone({plan:result.plan,alreadyPublished:Boolean(result.alreadyPublished)}));return result.alreadyPublished?{...result.plan,alreadyPublished:true}:result.plan;}
+ return res.code(400).send({error:"action 必须是 calculate、preview、reject 或 publish"});
+});
+app.post('/api/priority-requests',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const r:any={id:randomUUID(),intersectionId:b.intersectionId,routeId:b.routeId,etaSeconds:Number(b.etaSeconds),passengers:Number(b.passengers||0),requestType:b.requestType||'transit',status:'requested',requestedAt:now()};r.approved=r.passengers>=20||r.requestType==='emergency';r.status=r.approved?'approved':'deferred';priorityRequests.push(r);log('priority.request',r);return r;});
 app.post('/api/pedestrian-phase',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||b.crossingSeconds==null)return res.code(400).send({error:'intersectionId 和 crossingSeconds 必填'});const crossing=Number(b.crossingSeconds);if(crossing<7||crossing>60)return res.code(400).send({error:'crossingSeconds must be 7-60'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const p={id:randomUUID(),intersectionId:j.id,crossingSeconds:crossing,leadingInterval:Number(b.leadingInterval||3),accessible:Boolean(b.accessible),status:'validated',createdAt:now()};scenarioPolicies.push(p);return p;});
 app.post('/api/simulations/:id/emissions',async(req:any,res)=>{const r=runs.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'simulation not found'});const vkt=Number((req.body as any)?.vehicleKm||12000);const stopPenalty=(r.candidate?.totalDelay??r.baseline.totalDelay)/Math.max(1,r.baseline.horizon);return{simulationId:r.id,vehicleKm:vkt,co2Kg:Number((vkt*(.142+stopPenalty*.0008)).toFixed(2)),noxGrams:Number((vkt*(.32+stopPenalty*.0015)).toFixed(2)),idleHours:Number((stopPenalty*vkt/3600).toFixed(2)),method:'speed-delay surrogate model'};});
 app.post('/api/evacuation-scenarios',async(req:any)=>{const b=req.body as any;const blocked=(b.blockedIntersections||[]) as string[];const original=incidents.length;for(const id of blocked)incidents.push({id:randomUUID(),intersectionId:id,type:'evacuation-block',severity:'high',status:'active',startedAt:now()});const result=simulate({horizon:b.horizon||1800,demand:b.demand});incidents.splice(original);return{id:randomUUID(),type:'evacuation',blockedIntersections:blocked,result,recommendation:result.spillbacks>3?'open reversible lanes and meter upstream inflow':'maintain coordinated offsets'};});
 app.get('/api/priority-requests',async()=>priorityRequests);
 
-app.listen({port:Number(process.env.PORT||6302),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
+export { app };
+
+if (process.env.NODE_ENV !== 'test') {
+ app.listen({port:Number(process.env.PORT||6302),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
+}
