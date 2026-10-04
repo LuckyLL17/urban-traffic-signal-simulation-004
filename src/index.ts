@@ -1,7 +1,17 @@
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
 
-type Phase={id:string;green:number;yellow:number;red:number}; type Intersection={id:string;name:string;phases:Phase[];cycle:number;queues:Record<string,number>;capacity:number;offset?:number};
+type Phase={id:string;green:number;yellow:number;red:number};
+type Intersection={id:string;name:string;phases:Phase[];cycle:number;queues:Record<string,number>;capacity:number;offset?:number};
+type TravelDirection='FORWARD'|'REVERSE';
+type CoordinationStatus='calculated'|'rejected'|'published'|'superseded';
+type CorridorLink={fromIntersectionId:string;toIntersectionId:string;distanceMeters:number;directionDegrees:number};
+type Corridor={id:string;name:string;intersectionIds:string[];lengthMeters:number;targetSpeedKph:number;links?:CorridorLink[]};
+type CorridorSegmentInput={fromIntersectionId?:string;toIntersectionId?:string;distanceMeters?:number;directionDegrees?:number};
+type CorridorSegment={order:number;fromIntersectionId:string;toIntersectionId:string;distanceMeters:number;directionDegrees:number};
+type CorridorStopProposal={intersectionId:string;order:number;segmentFromPreviousMeters:number|null;directionFromPreviousDegrees:number|null;cumulativeMeters:number;travelSeconds:number;cycleSeconds:number;wrapCount:number;rawOffsetSeconds:number;offsetSeconds:number};
+type nowString=string;
+type CorridorCoordinationVersion={id:string;corridorId:string;versionNumber:number;status:CoordinationStatus;speedKph:number;travelDirection:TravelDirection;request:{speedKph:number;travelDirection:TravelDirection;segments:CorridorSegmentInput[]|null};segments:CorridorSegment[];stops:CorridorStopProposal[];proposedOffsets:Record<string,number>;baselineOffsets:Record<string,number|null>;maxCycleSeconds:number;createdAt:nowString;rejectedAt?:nowString;rejectReason?:string;publishedAt?:nowString;supersededAt?:nowString;sourceVersionId?:string};
 const app=Fastify({logger:true}); const now=()=>new Date().toISOString();
 const intersections:Intersection[]=[
 {id:'J-01',name:'人民路/中山路',phases:[{id:'NS',green:38,yellow:3,red:39},{id:'EW',green:32,yellow:3,red:45}],cycle:80,queues:{N:12,S:8,E:15,W:11},capacity:42},
@@ -46,10 +56,174 @@ app.get('/api/simulations/:id',async(req:any,res)=>{const r=runs.find(x=>x.id===
 app.get('/api/audit',async()=>audit.slice(-100));
 
 // Advanced operations: corridor coordination, transit priority, pedestrian safety and emissions.
-const priorityRequests:any[]=[]; const corridors:any[]=[{id:'C-01',name:'中山路绿波走廊',intersectionIds:['J-01','J-02','J-03'],lengthMeters:2400,targetSpeedKph:36}]; const scenarioPolicies:any[]=[];
+const priorityRequests:any[]=[]; const corridors:(Corridor&{coordinationVersions:CorridorCoordinationVersion[]})[]=[{id:'C-01',name:'中山路绿波走廊',intersectionIds:['J-01','J-02','J-03'],lengthMeters:2400,targetSpeedKph:36,links:[{fromIntersectionId:'J-01',toIntersectionId:'J-02',distanceMeters:900,directionDegrees:90},{fromIntersectionId:'J-02',toIntersectionId:'J-03',distanceMeters:1500,directionDegrees:90}],coordinationVersions:[]}]; const scenarioPolicies:any[]=[];
 app.get('/api/corridors',async()=>corridors);
-app.post('/api/corridors/:id/coordinate',async(req:any,res)=>{const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});const b=req.body as any;const speedKph=Number(b.speedKph||c.targetSpeedKph);if(speedKph<10||speedKph>70)return res.code(400).send({error:'speedKph must be 10-70'});const cycle=Math.max(...c.intersectionIds.map((id:string)=>intersections.find(x=>x.id===id)?.cycle||60));const offsets:any={};let distanceSeconds=0;for(const id of c.intersectionIds){const j=intersections.find(x=>x.id===id)!;distanceSeconds+=c.lengthMeters/c.intersectionIds.length/(speedKph/3.6);offsets[id]=Math.round(distanceSeconds%cycle);j.offset=offsets[id];}const plan={id:randomUUID(),corridorId:c.id,cycleSeconds:cycle,speedKph,offsets,createdAt:now(),status:'coordinated'};plans.push(plan);log('corridor.coordinate',plan);return plan;});
-app.post('/api/priority-requests',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const r={id:randomUUID(),intersectionId:b.intersectionId,routeId:b.routeId,etaSeconds:Number(b.etaSeconds),passengers:Number(b.passengers||0),requestType:b.requestType||'transit',status:'requested',requestedAt:now()};r.approved=r.passengers>=20||r.requestType==='emergency';r.status=r.approved?'approved':'deferred';priorityRequests.push(r);log('priority.request',r);return r;});
+
+class DomainValidationError extends Error{constructor(public details:string[]){super(details.join('; '));this.name='DomainValidationError';}}
+type StoredCorridor=Corridor&{coordinationVersions:CorridorCoordinationVersion[]};
+const findCorridor=(id:string)=>corridors.find(x=>x.id===id);
+const findVersion=(c:StoredCorridor,versionId:string)=>c.coordinationVersions.find(v=>v.id===versionId||String(v.versionNumber)===versionId);
+function parseTravelDirection(value:unknown):TravelDirection{
+ const direction=String(value??'FORWARD').toUpperCase();
+ if(direction!=='FORWARD'&&direction!=='REVERSE')throw new DomainValidationError([`travelDirection must be FORWARD or REVERSE, received ${String(value)}`]);
+ return direction;
+}
+function canonicalSegments(c:Corridor):Required<CorridorSegment>[]{
+ const links=c.links?.length===c.intersectionIds.length-1?c.links:c.intersectionIds.slice(1).map((toIntersectionId,index)=>({fromIntersectionId:c.intersectionIds[index],toIntersectionId,distanceMeters:c.lengthMeters/(c.intersectionIds.length-1),directionDegrees:0}));
+ return links.map((link,index)=>({order:index,fromIntersectionId:link.fromIntersectionId,toIntersectionId:link.toIntersectionId,distanceMeters:link.distanceMeters,directionDegrees:link.directionDegrees}));
+}
+function resolveSegments(c:Corridor,travelDirection:TravelDirection,rawSegments:unknown):CorridorSegment[]{
+ const canonical=canonicalSegments(c);
+ const expected=travelDirection==='REVERSE'?canonical.map(link=>({...link,fromIntersectionId:link.toIntersectionId,toIntersectionId:link.fromIntersectionId,directionDegrees:(link.directionDegrees+180)%360})).reverse():canonical;
+ if(rawSegments==null)return expected;
+ if(!Array.isArray(rawSegments))throw new DomainValidationError(['segments must be an array']);
+ if(rawSegments.length!==expected.length)throw new DomainValidationError([`segments must contain ${expected.length} adjacent links for ${c.intersectionIds.length} intersections`]);
+ const errors:string[]=[];
+ const segments=rawSegments.map((raw:any,index)=>{
+  const wanted=expected[index];
+  const fromIntersectionId=raw?.fromIntersectionId??wanted.fromIntersectionId;
+  const toIntersectionId=raw?.toIntersectionId??wanted.toIntersectionId;
+  const distanceMeters=Number(raw?.distanceMeters??wanted.distanceMeters);
+  const directionDegrees=Number(raw?.directionDegrees??wanted.directionDegrees);
+  if(fromIntersectionId!==wanted.fromIntersectionId||toIntersectionId!==wanted.toIntersectionId)errors.push(`segments[${index}]: expected ${wanted.fromIntersectionId} -> ${wanted.toIntersectionId} for ${travelDirection} order`);
+  if(!Number.isFinite(distanceMeters)||distanceMeters<=0||distanceMeters>100000)errors.push(`segments[${index}]: distanceMeters must be 0-100000`);
+  if(!Number.isFinite(directionDegrees)||directionDegrees<0||directionDegrees>=360)errors.push(`segments[${index}]: directionDegrees must be 0-360 (exclusive 360)`);
+  return {order:index,fromIntersectionId,toIntersectionId,distanceMeters,directionDegrees};
+ });
+ if(errors.length)throw new DomainValidationError(errors);
+ return segments;
+}
+function buildCoordination(c:StoredCorridor,b:any,sourceVersionId?:string):Omit<CorridorCoordinationVersion,'id'|'versionNumber'|'createdAt'|'status'>{
+ const errors:string[]=[];
+ const speedKph=Number(b?.speedKph??c.targetSpeedKph);
+ if(!Number.isFinite(speedKph)||speedKph<10||speedKph>70)errors.push('speedKph must be 10-70');
+ let travelDirection:TravelDirection='FORWARD';
+ try{travelDirection=parseTravelDirection(b?.travelDirection);}catch(e){errors.push(...(e as DomainValidationError).details);}
+ let segments:CorridorSegment[]=[];
+ try{segments=resolveSegments(c,travelDirection,b?.segments);}catch(e){errors.push(...(e as DomainValidationError).details);}
+ const orderedIntersectionIds=travelDirection==='REVERSE'?[...c.intersectionIds].reverse():c.intersectionIds;
+ const stopsData=orderedIntersectionIds.map((intersectionId,index)=>{
+  const j=intersections.find(x=>x.id===intersectionId);
+  if(!j){errors.push(`${intersectionId}: intersection not found`);return null;}
+  if(!Number.isInteger(j.cycle)||j.cycle<30||j.cycle>180)errors.push(`${intersectionId}: current cycle must be an integer in 30-180 seconds`);
+  if(j.offset!==undefined&&(!Number.isInteger(j.offset)||j.offset<0||j.offset>=j.cycle))errors.push(`${intersectionId}: current offset must be an integer in its cycle before coordination`);
+  return {j,index};
+ });
+ if(errors.length)throw new DomainValidationError(errors);
+ const baselineOffsets:Record<string,number|null>={};
+ const proposedOffsets:Record<string,number>={};
+ const stops:CorridorStopProposal[]=[];
+ let cumulativeMeters=0;
+ for(const item of stopsData){
+  if(!item)continue;
+  const {j,index}=item;
+  const segment=index===0?null:segments[index-1];
+  cumulativeMeters+=segment?.distanceMeters??0;
+  const travelSeconds=Number((cumulativeMeters/(speedKph/3.6)).toFixed(3));
+  const rawOffsetSeconds=Math.round(travelSeconds);
+  const wrapCount=Math.floor(rawOffsetSeconds/j.cycle);
+  const offsetSeconds=rawOffsetSeconds%j.cycle;
+  baselineOffsets[j.id]=j.offset??null;
+  proposedOffsets[j.id]=offsetSeconds;
+  stops.push({intersectionId:j.id,order:index,segmentFromPreviousMeters:segment?.distanceMeters??null,directionFromPreviousDegrees:segment?.directionDegrees??null,cumulativeMeters:Number(cumulativeMeters.toFixed(3)),travelSeconds,cycleSeconds:j.cycle,wrapCount,rawOffsetSeconds,offsetSeconds});
+ }
+ return {corridorId:c.id,speedKph,travelDirection,request:{speedKph,travelDirection,segments:Array.isArray(b?.segments)?b.segments:null},segments,stops,proposedOffsets,baselineOffsets,maxCycleSeconds:Math.max(...stops.map(s=>s.cycleSeconds)),sourceVersionId};
+}
+function createVersion(c:StoredCorridor,b:any,sourceVersion?:CorridorCoordinationVersion){
+ const draft=buildCoordination(c,b,sourceVersion?.id);
+ const version:CorridorCoordinationVersion={...draft,id:randomUUID(),versionNumber:c.coordinationVersions.length+1,status:'calculated',createdAt:now(),sourceVersionId:sourceVersion?.id};
+ c.coordinationVersions.push(version);
+ log(sourceVersion?'corridor.coordination.recalculate':'corridor.coordination.calculate',{corridorId:c.id,versionId:version.id,versionNumber:version.versionNumber,speedKph:version.speedKph,travelDirection:version.travelDirection,sourceVersionId:version.sourceVersionId});
+ return version;
+}
+function buildPreview(v:CorridorCoordinationVersion){
+ return {version:v,network:{intersections:v.stops.map(stop=>{
+  const j=intersections.find(x=>x.id===stop.intersectionId)!;
+  const currentOffset=j.offset??null;
+  const delta=currentOffset===null?stop.offsetSeconds:stop.offsetSeconds-currentOffset;
+  return {intersectionId:stop.intersectionId,currentOffset,proposedOffset:stop.offsetSeconds,cycleSeconds:stop.cycleSeconds,offsetDeltaSeconds:delta,wouldChange:currentOffset!==stop.offsetSeconds};
+ })}};
+}
+app.post('/api/corridors/:id/coordination/calculate',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ try{return createVersion(c,req.body as any);}catch(e){if(e instanceof DomainValidationError){log('corridor.coordination.invalid',{corridorId:c.id,details:e.details,body:req.body});return res.code(400).send({error:'validation failed',details:e.details});}throw e;}
+});
+app.get('/api/corridors/:id/coordination/versions',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const status=String((req.query as any)?.status??'').toUpperCase();
+ return c.coordinationVersions.filter(v=>!status||v.status===status);
+});
+app.get('/api/corridors/:id/coordination/version/:versionRef',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const version=findVersion(c,(req.params as any).versionRef);
+ if(!version)return res.code(404).send({error:'coordination version not found'});
+ return version;
+});
+app.get('/api/corridors/:id/coordination/:versionId/preview',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const version=findVersion(c,(req.params as any).versionId);
+ if(!version)return res.code(404).send({error:'coordination version not found'});
+ return buildPreview(version);
+});
+app.post('/api/corridors/:id/coordination/:versionId/reject',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const version=findVersion(c,(req.params as any).versionId);
+ if(!version)return res.code(404).send({error:'coordination version not found'});
+ if(version.status!=='calculated')return res.code(409).send({error:'only calculated versions can be rejected',status:version.status});
+ version.status='rejected';version.rejectedAt=now();version.rejectReason=String((req.body as any)?.reason??'rejected before publication');
+ log('corridor.coordination.reject',{corridorId:c.id,versionId:version.id,versionNumber:version.versionNumber,reason:version.rejectReason});
+ return version;
+});
+app.post('/api/corridors/:id/coordination/:versionId/recalculate',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const source=findVersion(c,(req.params as any).versionId);
+ if(!source)return res.code(404).send({error:'coordination version not found'});
+ if(source.status!=='rejected')return res.code(409).send({error:'only rejected versions can be recalculated',status:source.status});
+ const body=req.body as any;
+ try{return createVersion(c,{speedKph:body?.speedKph??source.speedKph,travelDirection:body?.travelDirection??source.travelDirection,segments:body?.segments??source.request.segments??undefined},source);}catch(e){if(e instanceof DomainValidationError){log('corridor.coordination.recalculate-invalid',{corridorId:c.id,sourceVersionId:source.id,details:e.details});return res.code(400).send({error:'validation failed',details:e.details});}throw e;}
+});
+app.post('/api/corridors/:id/coordination/:versionId/publish',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ const version=findVersion(c,(req.params as any).versionId);
+ if(!version)return res.code(404).send({error:'coordination version not found'});
+ if(version.status!=='calculated')return res.code(409).send({error:'only calculated versions can be published',status:version.status});
+ const errors:string[]=[];
+ for(const stop of version.stops){
+  const j=intersections.find(x=>x.id===stop.intersectionId);
+  const baseline=version.baselineOffsets[stop.intersectionId];
+  const current=j?.offset??null;
+  if(!j)errors.push(`${stop.intersectionId}: intersection no longer exists`);
+  else if(j.cycle!==stop.cycleSeconds)errors.push(`${stop.intersectionId}: cycle changed from ${stop.cycleSeconds} to ${j.cycle} after calculation`);
+  else if(current!==baseline)errors.push(`${stop.intersectionId}: offset changed after calculation`);
+  else if(!Number.isInteger(stop.offsetSeconds)||stop.offsetSeconds<0||stop.offsetSeconds>=stop.cycleSeconds)errors.push(`${stop.intersectionId}: proposed offset is outside its cycle`);
+ }
+ if(errors.length){log('corridor.coordination.publish-blocked',{corridorId:c.id,versionId:version.id,details:errors});return res.code(409).send({error:'stale or invalid coordination version',details:errors});}
+ const previousPublished=c.coordinationVersions.find(x=>x.status==='published');
+ for(const stop of version.stops)intersections.find(x=>x.id===stop.intersectionId)!.offset=stop.offsetSeconds;
+ previousPublished&&(previousPublished.status='superseded',previousPublished.supersededAt=now());
+ version.status='published';version.publishedAt=now();
+ log('corridor.coordination.publish',{corridorId:c.id,versionId:version.id,versionNumber:version.versionNumber,supersededVersionId:previousPublished?.id,offsets:version.proposedOffsets});
+ return version;
+});
+app.get('/api/corridors/:id/audit',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ return audit.filter(x=>x.payload?.corridorId===c.id);
+});
+// Deprecated: retained for compatibility, but now creates an unpublished draft instead of mutating offsets.
+app.post('/api/corridors/:id/coordinate',async(req:any,res)=>{
+ const c=findCorridor((req.params as any).id);
+ if(!c)return res.code(404).send({error:'corridor not found'});
+ try{return{deprecated:true,message:'use /coordination/calculate, then preview and publish',version:createVersion(c,req.body as any)};}catch(e){if(e instanceof DomainValidationError)return res.code(400).send({error:'validation failed',details:e.details});throw e;}
+});
+app.post('/api/priority-requests',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const r:any={id:randomUUID(),intersectionId:b.intersectionId,routeId:b.routeId,etaSeconds:Number(b.etaSeconds),passengers:Number(b.passengers||0),requestType:b.requestType||'transit',status:'requested',requestedAt:now()};r.approved=r.passengers>=20||r.requestType==='emergency';r.status=r.approved?'approved':'deferred';priorityRequests.push(r);log('priority.request',r);return r;});
 app.post('/api/pedestrian-phase',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||b.crossingSeconds==null)return res.code(400).send({error:'intersectionId 和 crossingSeconds 必填'});const crossing=Number(b.crossingSeconds);if(crossing<7||crossing>60)return res.code(400).send({error:'crossingSeconds must be 7-60'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const p={id:randomUUID(),intersectionId:j.id,crossingSeconds:crossing,leadingInterval:Number(b.leadingInterval||3),accessible:Boolean(b.accessible),status:'validated',createdAt:now()};scenarioPolicies.push(p);return p;});
 app.post('/api/simulations/:id/emissions',async(req:any,res)=>{const r=runs.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'simulation not found'});const vkt=Number((req.body as any)?.vehicleKm||12000);const stopPenalty=(r.candidate?.totalDelay??r.baseline.totalDelay)/Math.max(1,r.baseline.horizon);return{simulationId:r.id,vehicleKm:vkt,co2Kg:Number((vkt*(.142+stopPenalty*.0008)).toFixed(2)),noxGrams:Number((vkt*(.32+stopPenalty*.0015)).toFixed(2)),idleHours:Number((stopPenalty*vkt/3600).toFixed(2)),method:'speed-delay surrogate model'};});
 app.post('/api/evacuation-scenarios',async(req:any)=>{const b=req.body as any;const blocked=(b.blockedIntersections||[]) as string[];const original=incidents.length;for(const id of blocked)incidents.push({id:randomUUID(),intersectionId:id,type:'evacuation-block',severity:'high',status:'active',startedAt:now()});const result=simulate({horizon:b.horizon||1800,demand:b.demand});incidents.splice(original);return{id:randomUUID(),type:'evacuation',blockedIntersections:blocked,result,recommendation:result.spillbacks>3?'open reversible lanes and meter upstream inflow':'maintain coordinated offsets'};});

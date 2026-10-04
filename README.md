@@ -28,3 +28,14 @@ npm run dev
 - 疏散场景、封闭路口和上游拥堵外溢推演
 
 扩展接口：`/api/corridors`、`/api/priority-requests`、`/api/pedestrian-phase`、`/api/evacuation-scenarios`、`/api/simulations/:id/emissions`。
+
+### 走廊绿波方案：计算 → 预览 → 发布
+
+`POST /api/corridors/:id/coordinate` 已保留兼容，但不会再立即修改路口 offset，只会生成未发布方案。新流程使用：
+
+1. `POST /api/corridors/:id/coordination/calculate`：按相邻路段距离、行驶方向和速度生成方案版本。
+2. `GET /api/corridors/:id/coordination/:versionId/preview`：比较当前 offset 与候选 offset，不写入路网。
+3. `POST /api/corridors/:id/coordination/:versionId/reject`：拒绝方案；拒绝后可调用 `/recalculate` 生成新版本。
+4. `POST /api/corridors/:id/coordination/:versionId/publish`：发布方案，只有此时才原子写入路口 offset；旧发布版本自动标记为 `superseded`。
+
+版本和审计接口：`GET /api/corridors/:id/coordination/versions`、`GET /api/corridors/:id/coordination/version/:versionRef`、`GET /api/corridors/:id/audit`。速度限定 10–70 km/h，距离必须为正数，方向角限定 `[0,360)`，行驶方向为 `FORWARD` 或 `REVERSE`；每个路口按各自周期计算回绕，`wrapCount` 表示跨周期次数。非法请求不会创建版本，也不会改变任何路口状态。
